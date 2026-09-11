@@ -1,0 +1,26 @@
+{
+  "PostToolUse": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/src/post_tool_hook.py\"",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "PostCompaction": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/src/post_compaction_hook.py\"",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}
