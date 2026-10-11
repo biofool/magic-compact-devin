@@ -10,6 +10,7 @@ identical copies may be vendored at .claude/hooks/post_edit_lint.py.
 Stdlib only. Every check no-ops when its tool is absent.
 """
 
+import importlib.util
 import json
 import os
 import shutil
@@ -25,16 +26,41 @@ TIMEOUT = 20
 MAX_OUT = 1200
 
 
-def _ruff(file: Path) -> list[str]:
-    # Prefer a repo venv ruff over whatever is on PATH.
+def _repo_root(file: Path) -> Path | None:
     for cand in (file.parent, *file.parents):
-        for rel in (".venv/bin/ruff", "backend/.venv/bin/ruff", "venv/bin/ruff"):
-            p = cand / rel
-            if p.is_file():
-                return _run([str(p), "check", "--output-format=concise", str(file)])
+        if (cand / ".git").exists():
+            return cand
+    return None
+
+
+def _py_check(file: Path) -> list[str]:
+    try:
+        compile(file.read_bytes(), str(file), "exec")
+    except SyntaxError as e:
+        return [f"{file.name}: {e.msg} (line {e.lineno})"]
+    except (OSError, UnicodeDecodeError):
+        pass
+    return []
+
+
+def _ruff(file: Path) -> list[str]:
+    # Prefer a repo venv ruff over whatever is on PATH, but never walk above
+    # the file's git root — a planted .venv in an ancestor dir would otherwise
+    # execute attacker code on every edit. shortcut: a venv planted inside a
+    # hostile repo itself still runs; treat working in untrusted clones as
+    # trusted-context only.
+    root = _repo_root(file)
+    if root is not None:
+        for cand in (file.parent, *file.parents):
+            for rel in (".venv/bin/ruff", "backend/.venv/bin/ruff", "venv/bin/ruff"):
+                p = cand / rel
+                if p.is_file():
+                    return _run([str(p), "check", "--output-format=concise", str(file)])
+            if cand == root:
+                break
     if shutil.which("ruff"):
         return _run(["ruff", "check", "--output-format=concise", str(file)])
-    return _run([sys.executable, "-m", "py_compile", str(file)])
+    return _py_check(file)
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> list[str]:
@@ -63,7 +89,7 @@ def checks_for(file: Path) -> list[str]:
         if not out and shutil.which("shellcheck"):
             out = _run(["shellcheck", "-S", "error", str(file)])
         return out
-    if ext == ".json" and not name.endswith((".jsonc",)):
+    if ext == ".json":
         return _run([sys.executable, "-m", "json.tool", str(file)])
     if ext == ".go" and shutil.which("gofmt"):
         try:
@@ -75,6 +101,8 @@ def checks_for(file: Path) -> list[str]:
             pass
         return []
     if ext in (".yml", ".yaml"):
+        if importlib.util.find_spec("yaml") is None:
+            return []
         return _run([sys.executable, "-c",
                      "import sys,yaml; yaml.safe_load(open(sys.argv[1]))", str(file)])
     return []
@@ -87,11 +115,15 @@ def main() -> None:
         sys.exit(0)
     if data.get("tool_name") not in EDIT_TOOLS:
         sys.exit(0)
-    ti = data.get("tool_input") or {}
+    ti = data.get("tool_input")
+    if not isinstance(ti, dict):
+        sys.exit(0)
     path = ti.get("file_path") or ti.get("notebook_path") or ""
     if not path or not os.path.isfile(path):
         sys.exit(0)
-    findings = checks_for(Path(path))
+    # resolve() so the argv path always starts with '/' — a relative-looking
+    # name like -e.py can never be parsed as a flag by the linter.
+    findings = checks_for(Path(path).resolve())
     if findings:
         sys.stderr.write(f"post-edit lint findings in {path}:\n")
         for f in findings:

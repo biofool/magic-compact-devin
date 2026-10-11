@@ -6,9 +6,9 @@ Write at least ~80% of each chat reply in **Simplified Technical English (STE)**
 **Default branch:** main
 
 ## Pages
-- [[Architecture]] — repo layout and key components
-- [[Development]] — build / test / deploy commands
-- [[Security]] — 2026-10 audit outcome and open security tickets
+- [Architecture](Architecture.md) — repo layout and key components
+- [Development](Development.md) — build / test / deploy commands
+- [Security](Security.md) — 2026-10 audit outcome and open security tickets
 
 ## Recent activity
 ```

@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """PostToolUse hook: cache large tool outputs for later retrieval after compaction."""
+import fcntl
+import hashlib
 import json
+import os
+import re
+import secrets
 import sys
+import tempfile
+import time
 from pathlib import Path
 
-CACHE_DIR = Path.home() / ".local" / "share" / "devin" / "magic-compact"
+CACHE_DIR = Path(os.environ.get(
+    "MAGIC_COMPACT_CACHE_DIR",
+    Path.home() / ".local" / "share" / "devin" / "magic-compact"))
+MAX_ENTRIES = 100          # per session; oldest content IDs evicted first
+MAX_FILE_AGE_DAYS = 30     # cache/handoff/token/lock files older than this are swept
 
 DEFAULT_THRESHOLD = {"words": 128, "chars": 1024}
 AGENT_THRESHOLD = {"words": 512, "chars": 4096}
@@ -26,6 +37,78 @@ ALWAYS_CACHE = {"read", "notebook_read"}
 # Higher threshold for subagent outputs
 AGENT_TOOLS = {"run_subagent", "read_subagent"}
 
+# --- Secret scrubbing -------------------------------------------------------
+# The cache persists tool output to disk. Anything that looks like a real
+# credential is redacted before it is written — the agent can re-run the tool
+# if it needs the value again, and the transcript already held it live.
+
+# KEY=value lines where the key name screams "credential".
+_ENV_KEY_RE = re.compile(
+    r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_PWD|_CREDENTIALS?|PRIVATE_KEY|API_KEY|AUTH_TOKEN|ACCESS_KEY)"
+    r"[A-Za-z0-9_]*\s*=\s*)(.+?)\s*$"
+)
+# JSON/YAML-ish "key": "value" / key: value forms.
+_JSON_KEY_RE = re.compile(
+    r"((?:api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|access[_-]?key)"
+    r"[\"']?\s*[:=]\s*[\"'])([^\"']{8,})([\"'])",
+    re.IGNORECASE,
+)
+# Well-known token prefixes.
+_TOKEN_RE = re.compile(
+    r"\b("
+    r"sk-[A-Za-z0-9_-]{16,}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AKIA[A-Z0-9]{16}"
+    r"|AIza[A-Za-z0-9_-]{30,}"
+    r"|ya29\.[A-Za-z0-9_-]{20,}"
+    r")\b"
+)
+_PEM_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+# Values that look like a credential slot but are clearly not real.
+_PLACEHOLDER_RE = re.compile(
+    r"^('''|\"\"|''|<[^>]*>|\$\{[^}]*\}|\$\([^)]*\)|"
+    r"(?i:your[-_ ].*|xxx+|<+.*>+|changeme|change[-_ ]?me|example|test|dummy|"
+    r"placeholder|redacted|<redacted>|none|null|true|false|\d+))$"
+)
+
+
+def _looks_placeholder(value: str) -> bool:
+    return bool(_PLACEHOLDER_RE.match(value.strip().strip("\"'")))
+
+
+def _redact_env_line(match: re.Match) -> str:
+    if _looks_placeholder(match.group(2)):
+        return match.group(0)
+    return match.group(1) + "<redacted>"
+
+
+def _redact_json_pair(match: re.Match) -> str:
+    if _looks_placeholder(match.group(2)):
+        return match.group(0)
+    return match.group(1) + "<redacted>" + match.group(3)
+
+
+def scrub_secrets(text: str) -> str:
+    """Redact credential material from output before it is persisted."""
+    text = _PEM_RE.sub(
+        "-----BEGIN PRIVATE KEY-----\n<redacted by magic-compact>\n-----END PRIVATE KEY-----",
+        text,
+    )
+    text = _TOKEN_RE.sub("<redacted>", text)
+    text = _JSON_KEY_RE.sub(_redact_json_pair, text)
+    return "\n".join(
+        _ENV_KEY_RE.sub(_redact_env_line, line) if "=" in line else line
+        for line in text.split("\n")
+    )
+
+
+# --- Cache IO ---------------------------------------------------------------
 
 def word_count(text: str) -> int:
     trimmed = text.strip()
@@ -43,24 +126,127 @@ def _session_file(session_id: str, suffix: str = ".json") -> Path | None:
     return CACHE_DIR / f"{session_id}{suffix}"
 
 
+def _digest(output: str) -> str:
+    return hashlib.sha256(output.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
+def _empty_cache(session_id: str) -> dict:
+    return {"version": 1, "session_id": session_id, "next_id": 1, "entries": {}}
+
+
+def _normalize(cache: dict) -> dict:
+    """Repair older entries in place: rename misnamed fields, add digests,
+    merge exact-duplicate outputs into one entry with a hit count."""
+    entries = cache.setdefault("entries", {})
+    by_digest: dict[str, str] = {}
+    for cid in sorted(entries):
+        entry = entries[cid]
+        if "prompt_id" not in entry and "timestamp" in entry:
+            entry["prompt_id"] = entry.pop("timestamp")
+        output = entry.get("output", "")
+        digest = entry.setdefault("digest", _digest(output))
+        canonical = by_digest.get(digest)
+        if canonical is None or entry.get("tool_name") != entries[canonical].get("tool_name"):
+            by_digest.setdefault(digest, cid)
+            entry.setdefault("count", 1)
+        else:
+            entries[canonical]["count"] = entries[canonical].get("count", 1) + entry.get("count", 1)
+            del entries[cid]
+    return cache
+
+
 def load_cache(session_id: str) -> dict:
     cache_file = _session_file(session_id)
     if cache_file is None or not cache_file.exists():
-        return {"version": 1, "session_id": session_id, "next_id": 1, "entries": {}}
+        return _empty_cache(session_id)
     try:
         with open(cache_file) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {"version": 1, "session_id": session_id, "next_id": 1, "entries": {}}
+            return _normalize(json.load(f))
+    except json.JSONDecodeError:
+        # Don't silently drop a corrupt cache (e.g. killed mid-write) — move it
+        # aside so the next save starts clean but the data is recoverable.
+        try:
+            os.replace(cache_file, cache_file.with_name(cache_file.name + ".corrupt"))
+        except OSError:
+            pass
+        return _empty_cache(session_id)
+    except IOError:
+        return _empty_cache(session_id)
+
+
+def _ensure_token(session_id: str) -> None:
+    """Write a random per-session credential (0600) that the MCP server
+    requires before serving cached content. The compaction hook re-injects it
+    into this session's own context, so only this session's agent can read it."""
+    token_file = _session_file(session_id, ".token")
+    if token_file is None or token_file.exists():
+        return
+    fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".tok-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(16))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, token_file)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _sweep() -> None:
+    """Delete cache/handoff/token/lock files older than MAX_FILE_AGE_DAYS."""
+    cutoff = time.time() - MAX_FILE_AGE_DAYS * 86400
+    try:
+        for p in CACHE_DIR.iterdir():
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def save_cache(session_id: str, cache: dict) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if CACHE_DIR.stat().st_mode & 0o077:
+        os.chmod(CACHE_DIR, 0o700)
     cache_file = _session_file(session_id)
     if cache_file is None:
         return
-    with open(cache_file, "w") as f:
-        json.dump(cache, f, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(cache, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, cache_file)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    _ensure_token(session_id)
+    _sweep()
+
+
+def update_cache(session_id: str, update) -> dict:
+    """Read-modify-write the session cache under an exclusive flock."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _session_file(session_id, ".lock")
+    if lock_path is None:
+        return _empty_cache(session_id)
+    with open(lock_path, "a") as lock_fd:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            cache = _normalize(load_cache(session_id))
+            update(cache)
+            entries = cache["entries"]
+            if len(entries) > MAX_ENTRIES:
+                # IDs are %03d-padded so lexicographic order == age order.
+                keep = sorted(entries)[-MAX_ENTRIES:]
+                cache["entries"] = {c: entries[c] for c in keep}
+            save_cache(session_id, cache)
+            return cache
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 def main() -> None:
@@ -93,17 +279,28 @@ def main() -> None:
     if not should_cache:
         sys.exit(0)
 
-    # Cache the output
-    cache = load_cache(session_id)
-    content_id = f"omitted-{cache['next_id']:03d}"
-    cache["next_id"] += 1
-    cache["entries"][content_id] = {
-        "tool_name": tool_name,
-        "tool_input": tool_input,
-        "output": output,
-        "timestamp": data.get("prompt_id", ""),
-    }
-    save_cache(session_id, cache)
+    output = scrub_secrets(output)
+    digest = _digest(output)
+    prompt_id = data.get("prompt_id", "")
+
+    def _add(cache: dict) -> None:
+        for cid, entry in cache["entries"].items():
+            if entry.get("digest") == digest and entry.get("tool_name") == tool_name:
+                entry["count"] = entry.get("count", 1) + 1
+                entry["prompt_id"] = prompt_id
+                return
+        content_id = f"omitted-{cache['next_id']:03d}"
+        cache["next_id"] += 1
+        cache["entries"][content_id] = {
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "output": output,
+            "prompt_id": prompt_id,
+            "digest": digest,
+            "count": 1,
+        }
+
+    update_cache(session_id, _add)
     sys.exit(0)
 
 

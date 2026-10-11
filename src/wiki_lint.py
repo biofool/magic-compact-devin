@@ -15,7 +15,11 @@ def lint(wiki: Path) -> list[str]:
     if not index.is_file():
         return ["INDEX.md missing"]
     pages = sorted(p.name for p in wiki.glob("*.md") if p.name != "INDEX.md")
-    indexed = set(re.findall(r"`([^`]+\.md)`", index.read_text()))
+    try:
+        indexed = set(re.findall(r"`([^`]+\.md)`", index.read_text()))
+    except (OSError, UnicodeDecodeError):
+        indexed = set()
+        problems.append("INDEX.md: unreadable")
     for p in pages:
         if p not in indexed:
             problems.append(f"{p}: exists but not listed in INDEX.md")
@@ -23,7 +27,11 @@ def lint(wiki: Path) -> list[str]:
         if name not in pages:
             problems.append(f"INDEX.md lists {name} — file missing")
     for p in wiki.glob("*.md"):
-        text = p.read_text()
+        try:
+            text = p.read_text()
+        except (OSError, UnicodeDecodeError):
+            problems.append(f"{p.name}: unreadable")
+            continue
         for link in re.findall(r"\]\(([^)]+\.md)\)", text):
             if not (wiki / link).is_file() and not link.startswith(("http", "/")):
                 problems.append(f"{p.name}: dead link {link}")
@@ -32,7 +40,12 @@ def lint(wiki: Path) -> list[str]:
                             f"(or mark `<!-- wiki-lint: long -->` if it's reference data)")
     dec = wiki / "decisions.md"
     if dec.is_file():
-        for line in dec.read_text().splitlines():
+        try:
+            dec_lines = dec.read_text().splitlines()
+        except (OSError, UnicodeDecodeError):
+            dec_lines = []
+            problems.append("decisions.md: unreadable")
+        for line in dec_lines:
             if line.startswith("##") and not re.search(r"\d{4}-\d{2}-\d{2}", line):
                 problems.append(f"decisions.md: undated entry '{line.strip()[:60]}'")
     return problems
