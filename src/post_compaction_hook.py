@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """PostCompaction hook: re-inject handoff document and cached content index."""
+import fcntl
 import json
 import os
 import secrets
@@ -14,7 +15,8 @@ CACHE_DIR = Path(os.environ.get(
 
 def _session_file(session_id: str, suffix: str = ".json") -> Path | None:
     """Cache path for a session; None if session_id would escape CACHE_DIR."""
-    if not session_id or "/" in session_id or "\\" in session_id or ".." in session_id:
+    if not isinstance(session_id, str) or not session_id \
+            or "/" in session_id or "\\" in session_id or ".." in session_id:
         return None
     return CACHE_DIR / f"{session_id}{suffix}"
 
@@ -25,9 +27,12 @@ def load_cache(session_id: str) -> dict | None:
         return None
     try:
         with open(cache_file) as f:
-            return json.load(f)
+            cache = json.load(f)
     except (json.JSONDecodeError, IOError):
         return None
+    if not isinstance(cache, dict) or not isinstance(cache.get("entries"), dict):
+        return None
+    return cache
 
 
 MAX_INDEX_ENTRIES = 20
@@ -63,21 +68,31 @@ def index_lines(entries: dict) -> list[str]:
 def ensure_token(session_id: str) -> None:
     """Mint the per-session credential if missing. Safe here for the same
     reason as in post_tool_hook: this hook executes inside the owning
-    session. Sessions whose cache predates the credential feature otherwise
-    stay locked until their next cache write."""
+    session. Runs under the session flock — post_tool_hook mints under the
+    same lock, so the exists→replace sequence can't race with a cache write
+    and orphan the token injected into this context."""
     token_file = _session_file(session_id, ".token")
-    if token_file is None or token_file.exists():
+    lock_path = _session_file(session_id, ".lock")
+    if token_file is None or lock_path is None or token_file.exists():
         return
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".tok-")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(secrets.token_hex(16))
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, token_file)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    with open(lock_path, "a") as lock_fd:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            if token_file.exists():
+                return
+            fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".tok-")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(secrets.token_hex(16))
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, token_file)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 def read_token(session_id: str) -> str | None:
@@ -106,6 +121,8 @@ def main() -> None:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
+    if not isinstance(data, dict):
+        sys.exit(0)
 
     session_id = data.get("session_id", "")
     if not session_id:
@@ -122,6 +139,10 @@ def main() -> None:
     if handoff:
         if len(handoff) > MAX_HANDOFF_CHARS:
             handoff = handoff[:MAX_HANDOFF_CHARS] + "\n\n[truncated — exceeds 32 KB]"
+        # Neutralize the closing tag inside untrusted handoff text — a literal
+        # "</handoff-document" would escape the wrapper and re-enter context
+        # as apparent instructions.
+        handoff = handoff.replace("</handoff-document", "< /handoff-document")
         parts.append(
             "## Magic Compact — Handoff Document\n\n"
             "The block below is the handoff document written before compaction. "

@@ -25,6 +25,14 @@ EDIT_TOOLS = {
 TIMEOUT = 20
 MAX_OUT = 1200
 
+# These .json files allow comments/trailing commas — json.tool would
+# false-fail on every valid edit.
+JSONC_FILES = {
+    "tsconfig.json", "jsconfig.json", "devcontainer.json",
+    "settings.json", "launch.json", "tasks.json", "extensions.json",
+    ".code-workspace",
+}
+
 
 def _repo_root(file: Path) -> Path | None:
     for cand in (file.parent, *file.parents):
@@ -67,8 +75,12 @@ def _run(cmd: list[str], cwd: Path | None = None) -> list[str]:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            timeout=TIMEOUT, cwd=cwd)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    except FileNotFoundError:
+        return []  # tool absent — the documented no-op case
+    except subprocess.TimeoutExpired:
+        return [f"{cmd[0]}: timed out after {TIMEOUT}s — could not check file"]
+    except OSError as e:
+        return [f"{cmd[0]}: failed to run ({e}) — could not check file"]
     if r.returncode == 0:
         return []
     out = (r.stdout + r.stderr).strip()
@@ -89,16 +101,24 @@ def checks_for(file: Path) -> list[str]:
         if not out and shutil.which("shellcheck"):
             out = _run(["shellcheck", "-S", "error", str(file)])
         return out
-    if ext == ".json":
+    if ext == ".json" and name not in JSONC_FILES:
         return _run([sys.executable, "-m", "json.tool", str(file)])
     if ext == ".go" and shutil.which("gofmt"):
         try:
-            r = subprocess.run(["gofmt", "-l", str(file)],
+            # -e: report parse errors (stderr) too — gofmt -l alone lists
+            # nothing for syntactically invalid files.
+            r = subprocess.run(["gofmt", "-e", "-l", str(file)],
                                capture_output=True, text=True, timeout=TIMEOUT)
             if r.stdout.strip():
                 return [f"{file.name}: not gofmt-clean (run gofmt -w)"]
-        except (OSError, subprocess.TimeoutExpired):
+            if r.returncode != 0 or r.stderr.strip():
+                return [f"{file.name}: {r.stderr.strip()[:MAX_OUT]}"]
+        except FileNotFoundError:
             pass
+        except subprocess.TimeoutExpired:
+            return ["gofmt: timed out — could not check file"]
+        except OSError as e:
+            return [f"gofmt: failed to run ({e}) — could not check file"]
         return []
     if ext in (".yml", ".yaml"):
         if importlib.util.find_spec("yaml") is None:
@@ -112,6 +132,8 @@ def main() -> None:
     try:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
+        sys.exit(0)
+    if not isinstance(data, dict):
         sys.exit(0)
     if data.get("tool_name") not in EDIT_TOOLS:
         sys.exit(0)

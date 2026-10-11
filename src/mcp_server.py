@@ -46,6 +46,9 @@ def _authorized(session_id: str, token) -> str | None:
         expected = token_file.read_text().strip()
     except IOError:
         return "cache credential unreadable."
+    # compare_digest("", "") is True — a truncated/empty token file must deny.
+    if not expected:
+        return "cache credential unreadable."
     if not isinstance(token, str) or not hmac.compare_digest(token, expected):
         return "invalid session token."
     return None

@@ -42,16 +42,20 @@ AGENT_TOOLS = {"run_subagent", "read_subagent"}
 # credential is redacted before it is written — the agent can re-run the tool
 # if it needs the value again, and the transcript already held it live.
 
-# KEY=value lines where the key name screams "credential".
+# KEY=value lines where the key name screams "credential". The bare-name
+# branch covers PASSWORD=/SECRET=/TOKEN= with no underscore suffix.
 _ENV_KEY_RE = re.compile(
-    r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*"
+    r"^(\s*(?:export\s+)?(?:"
+    r"[A-Za-z_][A-Za-z0-9_]*"
     r"(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_PWD|_CREDENTIALS?|PRIVATE_KEY|API_KEY|AUTH_TOKEN|ACCESS_KEY)"
-    r"[A-Za-z0-9_]*\s*=\s*)(.+?)\s*$"
+    r"[A-Za-z0-9_]*"
+    r"|(?:PASSWORD|PASSWD|PWD|SECRET|TOKEN|CREDENTIALS|API[-_]?KEY|ACCESS[-_]?KEY)"
+    r")\s*=\s*)(.+?)\s*$"
 )
-# JSON/YAML-ish "key": "value" / key: value forms.
+# JSON/YAML-ish "key": "value" / key: value forms — quoted OR unquoted values.
 _JSON_KEY_RE = re.compile(
     r"((?:api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|access[_-]?key)"
-    r"[\"']?\s*[:=]\s*[\"'])([^\"']{8,})([\"'])",
+    r"[\"']?\s*[:=]\s*[\"']?)([^\s\"']{8,})([\"']?)",
     re.IGNORECASE,
 )
 # Well-known token prefixes.
@@ -64,6 +68,11 @@ _TOKEN_RE = re.compile(
     r"|AKIA[A-Z0-9]{16}"
     r"|AIza[A-Za-z0-9_-]{30,}"
     r"|ya29\.[A-Za-z0-9_-]{20,}"
+    r"|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"  # JWT
+    r"|glpat-[A-Za-z0-9_-]{15,}"
+    r"|pypi-[A-Za-z0-9_-]{15,}"
+    r"|whsec_[A-Za-z0-9_-]{15,}"
+    r"|(?:postgres|mysql|mongodb|redis|amqp)://[^\s:@/]+:[^\s@]+@"  # credentialed URI
     r")\b"
 )
 _PEM_RE = re.compile(
@@ -94,6 +103,17 @@ def _redact_json_pair(match: re.Match) -> str:
     return match.group(1) + "<redacted>" + match.group(3)
 
 
+def scrub_obj(o):
+    """Scrub every string inside a JSON-like structure (tool_input)."""
+    if isinstance(o, str):
+        return scrub_secrets(o)
+    if isinstance(o, list):
+        return [scrub_obj(x) for x in o]
+    if isinstance(o, dict):
+        return {k: scrub_obj(v) for k, v in o.items()}
+    return o
+
+
 def scrub_secrets(text: str) -> str:
     """Redact credential material from output before it is persisted."""
     text = _PEM_RE.sub(
@@ -121,13 +141,16 @@ def exceeds_threshold(text: str, limit: dict) -> bool:
 
 def _session_file(session_id: str, suffix: str = ".json") -> Path | None:
     """Cache path for a session; None if session_id would escape CACHE_DIR."""
-    if not session_id or "/" in session_id or "\\" in session_id or ".." in session_id:
+    if not isinstance(session_id, str) or not session_id \
+            or "/" in session_id or "\\" in session_id or ".." in session_id:
         return None
     return CACHE_DIR / f"{session_id}{suffix}"
 
 
 def _digest(output: str) -> str:
-    return hashlib.sha256(output.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    # "replace" not "surrogateescape": lone surrogates outside U+DC80–DCFF
+    # (legal in JSON input) would raise UnicodeEncodeError and kill the hook.
+    return hashlib.sha256(output.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _empty_cache(session_id: str) -> dict:
@@ -161,7 +184,7 @@ def load_cache(session_id: str) -> dict:
         return _empty_cache(session_id)
     try:
         with open(cache_file) as f:
-            return _normalize(json.load(f))
+            cache = json.load(f)
     except json.JSONDecodeError:
         # Don't silently drop a corrupt cache (e.g. killed mid-write) — move it
         # aside so the next save starts clean but the data is recoverable.
@@ -172,6 +195,9 @@ def load_cache(session_id: str) -> dict:
         return _empty_cache(session_id)
     except IOError:
         return _empty_cache(session_id)
+    if not isinstance(cache, dict) or not isinstance(cache.get("entries"), dict):
+        return _empty_cache(session_id)
+    return _normalize(cache)
 
 
 def _ensure_token(session_id: str) -> None:
@@ -193,11 +219,15 @@ def _ensure_token(session_id: str) -> None:
 
 
 def _sweep() -> None:
-    """Delete cache/handoff/token/lock files older than MAX_FILE_AGE_DAYS."""
+    """Delete cache/handoff files older than MAX_FILE_AGE_DAYS.
+    Never touches *.lock (a deleted live lock breaks flock mutual exclusion)
+    or *.token (a deleted credential locks the session out of its own cache)."""
     cutoff = time.time() - MAX_FILE_AGE_DAYS * 86400
     try:
         for p in CACHE_DIR.iterdir():
             try:
+                if p.suffix in (".lock", ".token"):
+                    continue
                 if p.is_file() and p.stat().st_mtime < cutoff:
                     p.unlink()
             except OSError:
@@ -310,6 +340,8 @@ def main() -> None:
         data = json.load(sys.stdin)
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)
+    if not isinstance(data, dict):
+        sys.exit(0)
 
     tool_name = data.get("tool_name", "")
     session_id = data.get("session_id", "")
@@ -347,6 +379,7 @@ def main() -> None:
         sys.exit(0)
 
     output = scrub_secrets(output)
+    tool_input = scrub_obj(tool_input)
     digest = _digest(output)
     prompt_id = data.get("prompt_id", "")
 
