@@ -74,4 +74,6 @@ cross-repo use.
 
 Run `python3 <plugin>/src/wiki_lint.py [wiki-dir]` — checks: INDEX lines
 resolve, pages are indexed, decisions are dated, no orphaned content.
-Run it after any structural wiki edit.
+Run it after any structural wiki edit. Pages over 200 lines must be
+split — unless they're genuinely flat reference data (a lookup table,
+an inventory), which opts out with `<!-- wiki-lint: long -->` at the top.

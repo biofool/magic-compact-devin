@@ -27,8 +27,9 @@ def lint(wiki: Path) -> list[str]:
         for link in re.findall(r"\]\(([^)]+\.md)\)", text):
             if not (wiki / link).is_file() and not link.startswith(("http", "/")):
                 problems.append(f"{p.name}: dead link {link}")
-        if len(text.splitlines()) > MAX_PAGE_LINES:
-            problems.append(f"{p.name}: {len(text.splitlines())} lines — split it")
+        if len(text.splitlines()) > MAX_PAGE_LINES and "<!-- wiki-lint: long -->" not in text:
+            problems.append(f"{p.name}: {len(text.splitlines())} lines — split it "
+                            f"(or mark `<!-- wiki-lint: long -->` if it's reference data)")
     dec = wiki / "decisions.md"
     if dec.is_file():
         for line in dec.read_text().splitlines():
