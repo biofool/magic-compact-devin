@@ -226,6 +226,62 @@ def save_cache(session_id: str, cache: dict) -> None:
     _sweep()
 
 
+TODOS_OPEN = "<!-- auto-todos -->"
+TODOS_CLOSE = "<!-- /auto-todos -->"
+
+
+def _format_todos(todos: list) -> str:
+    mark = {"completed": "x", "in_progress": "~"}
+    lines = []
+    for t in todos:
+        if isinstance(t, dict):
+            lines.append(f"- [{mark.get(t.get('status'), ' ')}] {t.get('content', '')}")
+    return "\n".join(lines)
+
+
+def update_handoff_todos(session_id: str, todos: list) -> None:
+    """Refresh the auto-todos block in <session>-handoff.md.
+
+    Devin has no PreCompaction hook, so the todo list is the cheapest always-
+    fresh handoff: every todo_write rewrites one marker-delimited section and
+    leaves the rest of the handoff (e.g. one written by /magic-compact) intact.
+    Runs under the same session lock as cache writes; atomic 0600 replace.
+    """
+    section = (f"{TODOS_OPEN}\n## Current todos\n\n"
+               f"{_format_todos(todos)}\n{TODOS_CLOSE}")
+    lock_path = _session_file(session_id, ".lock")
+    handoff_file = _session_file(session_id, "-handoff.md")
+    if lock_path is None or handoff_file is None:
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as lock_fd:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            existing = ""
+            try:
+                existing = handoff_file.read_text()
+            except OSError:
+                pass
+            if TODOS_OPEN in existing and TODOS_CLOSE in existing:
+                body = re.sub(
+                    re.escape(TODOS_OPEN) + r".*?" + re.escape(TODOS_CLOSE),
+                    section, existing, flags=re.DOTALL)
+            else:
+                body = (existing.rstrip() + "\n\n" + section + "\n") if existing else section + "\n"
+            fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=".ho-")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(body)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, handoff_file)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+
 def update_cache(session_id: str, update) -> dict:
     """Read-modify-write the session cache under an exclusive flock."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -258,7 +314,18 @@ def main() -> None:
     tool_name = data.get("tool_name", "")
     session_id = data.get("session_id", "")
 
-    if not session_id or tool_name in NEVER_CACHE:
+    if not session_id:
+        sys.exit(0)
+
+    # todo_write is never cached as content — instead it keeps the
+    # auto-todos block in the session handoff file fresh (see above).
+    if tool_name == "todo_write":
+        todos = data.get("tool_input", {}).get("todos")
+        if isinstance(todos, list):
+            update_handoff_todos(session_id, todos)
+        sys.exit(0)
+
+    if tool_name in NEVER_CACHE:
         sys.exit(0)
 
     tool_input = data.get("tool_input", {})

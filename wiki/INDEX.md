@@ -6,3 +6,4 @@
 | `Architecture.md` | repo layout and key components |
 | `Development.md` | build / test / deploy commands |
 | `Security.md` | 2026-10 audit outcome and open security tickets |
+| `Usage.md` | heartbeat, audit trail, mc search, auto-handoff, lint hook uses |

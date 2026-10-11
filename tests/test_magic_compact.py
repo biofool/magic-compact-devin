@@ -13,6 +13,7 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
+import mc  # noqa: E402
 import post_compaction_hook  # noqa: E402
 import post_tool_hook  # noqa: E402
 
@@ -186,6 +187,74 @@ class TestIndexCap(unittest.TestCase):
     def test_index_shows_count(self):
         entries = {"omitted-001": {"tool_name": "read", "output": "x", "count": 3}}
         self.assertIn("x3", post_compaction_hook.index_lines(entries)[-1])
+
+
+class TestAutoHandoff(CacheDirTestCase):
+    TODOS = [{"content": "fix bug", "status": "in_progress"},
+             {"content": "write docs", "status": "pending"},
+             {"content": "ship it", "status": "completed"}]
+
+    def test_creates_handoff_with_markers(self):
+        post_tool_hook.update_handoff_todos("s1", self.TODOS)
+        body = (self.dir / "s1-handoff.md").read_text()
+        self.assertIn(post_tool_hook.TODOS_OPEN, body)
+        self.assertIn("- [~] fix bug", body)
+        self.assertIn("- [x] ship it", body)
+        mode = (self.dir / "s1-handoff.md").stat().st_mode & 0o777
+        self.assertEqual(oct(mode), "0o600")
+
+    def test_preserves_existing_content(self):
+        (self.dir / "s1-handoff.md").write_text("# My handoff\n\nhand-written notes\n")
+        post_tool_hook.update_handoff_todos("s1", self.TODOS)
+        body = (self.dir / "s1-handoff.md").read_text()
+        self.assertIn("hand-written notes", body)
+        self.assertIn(post_tool_hook.TODOS_OPEN, body)
+
+    def test_replaces_section_not_appends(self):
+        post_tool_hook.update_handoff_todos("s1", self.TODOS)
+        post_tool_hook.update_handoff_todos("s1", [{"content": "only task", "status": "pending"}])
+        body = (self.dir / "s1-handoff.md").read_text()
+        self.assertEqual(body.count(post_tool_hook.TODOS_OPEN), 1)
+        self.assertIn("only task", body)
+        self.assertNotIn("fix bug", body)
+
+
+class TestMcSearch(CacheDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self._mc_orig = mc.CACHE_DIR
+        mc.CACHE_DIR = self.dir
+
+    def tearDown(self):
+        mc.CACHE_DIR = self._mc_orig
+        super().tearDown()
+
+    def _args(self, pattern, **kw):
+        import argparse
+        return argparse.Namespace(pattern=pattern, session=None, limit=50,
+                                  regex=False, ignore_case=False, input=False,
+                                  **kw)
+
+    def test_finds_across_sessions(self):
+        self._add("sess-a", "gcloud output: 3 instances RUNNING")
+        self._add("sess-b", "unrelated text here")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mc.cmd_search(self._args("gcloud"))
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("sess-a", out)
+        self.assertIn("3 instances RUNNING", out)
+        self.assertNotIn("sess-b", out)
+
+    def test_no_match_returns_1(self):
+        self._add("sess-a", "some output")
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mc.cmd_search(self._args("zzz-nomatch"))
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":
