@@ -7,9 +7,16 @@ from pathlib import Path
 CACHE_DIR = Path.home() / ".local" / "share" / "devin" / "magic-compact"
 
 
+def _session_file(session_id: str, suffix: str = ".json") -> Path | None:
+    """Cache path for a session; None if session_id would escape CACHE_DIR."""
+    if not session_id or "/" in session_id or "\\" in session_id or ".." in session_id:
+        return None
+    return CACHE_DIR / f"{session_id}{suffix}"
+
+
 def load_cache(session_id: str) -> dict | None:
-    cache_file = CACHE_DIR / f"{session_id}.json"
-    if not cache_file.exists():
+    cache_file = _session_file(session_id)
+    if cache_file is None or not cache_file.exists():
         return None
     try:
         with open(cache_file) as f:
@@ -19,8 +26,8 @@ def load_cache(session_id: str) -> dict | None:
 
 
 def read_handoff(session_id: str) -> str | None:
-    handoff_file = CACHE_DIR / f"{session_id}-handoff.md"
-    if not handoff_file.exists():
+    handoff_file = _session_file(session_id, "-handoff.md")
+    if handoff_file is None or not handoff_file.exists():
         return None
     try:
         with open(handoff_file) as f:

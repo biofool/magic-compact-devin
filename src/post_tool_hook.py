@@ -36,9 +36,16 @@ def exceeds_threshold(text: str, limit: dict) -> bool:
     return word_count(text) > limit["words"] or len(text) > limit["chars"]
 
 
+def _session_file(session_id: str, suffix: str = ".json") -> Path | None:
+    """Cache path for a session; None if session_id would escape CACHE_DIR."""
+    if not session_id or "/" in session_id or "\\" in session_id or ".." in session_id:
+        return None
+    return CACHE_DIR / f"{session_id}{suffix}"
+
+
 def load_cache(session_id: str) -> dict:
-    cache_file = CACHE_DIR / f"{session_id}.json"
-    if not cache_file.exists():
+    cache_file = _session_file(session_id)
+    if cache_file is None or not cache_file.exists():
         return {"version": 1, "session_id": session_id, "next_id": 1, "entries": {}}
     try:
         with open(cache_file) as f:
@@ -49,7 +56,9 @@ def load_cache(session_id: str) -> dict:
 
 def save_cache(session_id: str, cache: dict) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CACHE_DIR / f"{session_id}.json"
+    cache_file = _session_file(session_id)
+    if cache_file is None:
+        return
     with open(cache_file, "w") as f:
         json.dump(cache, f, indent=2)
 
