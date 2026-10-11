@@ -1,6 +1,6 @@
 # magic-compact-devin — Mini Wiki
 
-Write all chat replies in **Simplified Technical English (STE)**: short sentences, active voice, one instruction per sentence, approved and consistent terminology, no unexplained jargon. If strict STE would create confusion or ambiguity in a reply, drop the constraint and write whatever is briefest and clearest — STE serves clarity, not the other way around. Applies to chat output only — code, commit messages, and documentation keep their normal style.
+Write at least ~80% of each chat reply in **Simplified Technical English (STE)**: short sentences, active voice, one instruction per sentence, approved and consistent terminology, no unexplained jargon. The remaining ~20% is slack for spots where strict STE would create confusion or ambiguity — there, write whatever is briefest and clearest. STE serves clarity, not the other way around. Applies to chat output only — code, commit messages, and documentation keep their normal style.
 
 **Stack:** not detected
 **Default branch:** main
