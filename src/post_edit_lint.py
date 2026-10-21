@@ -8,7 +8,13 @@ exits 2 so the agent sees and can fix its own mistakes. Exit 0 = silent.
 Canonical copy lives in biofool/magic-compact-devin (src/post_edit_lint.py);
 identical copies may be vendored at .claude/hooks/post_edit_lint.py.
 Stdlib only. Every check no-ops when its tool is absent.
+
+Versioning: bump __version__ on every behavioral change so vendored copies
+can be diffed by stamp, not just by hash (issue #2). Detect drift with
+scripts/check_vendored_drift.py in the canonical repo.
 """
+
+__version__ = "1.1.0"
 
 import importlib.util
 import json

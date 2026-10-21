@@ -11,6 +11,13 @@ Usage:
     python3 scripts/jev_review.py HEAD~3     # review an explicit ref range
     python3 scripts/jev_review.py --strict   # exit 1 when the diff is flagged
 
+Canonical copy lives in biofool/magic-compact-devin (scripts/jev_review.py);
+identical copies may be vendored at scripts/jev_review.py.
+
+Versioning: bump __version__ on every behavioral change so vendored copies
+can be diffed by stamp, not just by hash (issue #2). Detect drift with
+scripts/check_vendored_drift.py in the canonical repo.
+
 Required env:
     JEV_API_KEY    TypeSafe API key
 Optional env:
@@ -20,6 +27,8 @@ Optional env:
 Install as a pre-push hook (optional):
     ln -s ../../scripts/jev_review.py .git/hooks/pre-push
 """
+__version__ = "1.1.0"
+
 import json
 import os
 import subprocess
