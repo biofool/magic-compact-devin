@@ -14,7 +14,7 @@ can be diffed by stamp, not just by hash (issue #2). Detect drift with
 scripts/check_vendored_drift.py in the canonical repo.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import importlib.util
 import json
@@ -30,6 +30,7 @@ EDIT_TOOLS = {
 }
 TIMEOUT = 20
 MAX_OUT = 1200
+PHP_MAX_LINES = 250
 
 # These .json files allow comments/trailing commas — json.tool would
 # false-fail on every valid edit.
@@ -93,13 +94,40 @@ def _run(cmd: list[str], cwd: Path | None = None) -> list[str]:
     return [out[:MAX_OUT]] if out else []
 
 
+def _php_checks(file: Path) -> list[str]:
+    out = _run(["php", "-l", str(file)]) if shutil.which("php") else []
+    # File-length gate — stdlib line count, skips blanks and //,#,/* */ lines.
+    try:
+        n, block = 0, False
+        for line in file.open(encoding="utf-8", errors="replace"):
+            s = line.strip()
+            if block:
+                if "*/" in s:
+                    block = False
+                continue
+            if not s or s.startswith(("//", "#")):
+                continue
+            if s.startswith("/*"):
+                if "*/" not in s:
+                    block = True
+                continue
+            n += 1
+    except OSError:
+        return out
+    if n > PHP_MAX_LINES:
+        out.append(
+            f"{file.name}: {n} non-comment lines exceeds max {PHP_MAX_LINES}"
+            " — split the file")
+    return out
+
+
 def checks_for(file: Path) -> list[str]:
     ext = file.suffix.lower()
     name = file.name
     if ext == ".py":
         return _ruff(file)
-    if ext == ".php" and shutil.which("php"):
-        return _run(["php", "-l", str(file)])
+    if ext == ".php":
+        return _php_checks(file)
     if ext in (".js", ".mjs", ".cjs") and shutil.which("node"):
         return _run(["node", "--check", str(file)])
     if ext in (".sh", ".bash") or name.endswith(".sh"):
