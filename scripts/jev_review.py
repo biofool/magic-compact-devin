@@ -31,6 +31,7 @@ __version__ = "1.1.0"
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -102,24 +103,70 @@ def staged_diff():
     return git("diff", "--staged"), "staged"
 
 
+def _key_candidates():
+    """Ordered (name, value) Jev key candidates: env, repo .env files,
+    then GCP Secret Manager (the portfolio's shared key store — see
+    story_graph config/secrets.py)."""
+    cands = []
+    seen = set()
+    def add(name, val):
+        val = (val or "").strip().strip("'\"")
+        if val and val not in seen:
+            seen.add(val)
+            cands.append((name, val))
+    for name in ("JEV_API_KEY", "OPENROUTER_API_KEY"):
+        add(name, os.environ.get(name))
+    for envf in (".env", ".env.secrets", "backend/.env",
+                 "backend/.env.secrets"):
+        try:
+            for line in open(envf):
+                m = re.match(r"\s*(JEV_API_KEY|OPENROUTER_API_KEY)\s*=\s*(.+)",
+                             line)
+                if m:
+                    add(m.group(1), m.group(2))
+        except OSError:
+            continue
+    try:
+        for name in ("OPENROUTER_API_KEY", "JEV_API_KEY"):
+            r = subprocess.run(
+                ["gcloud", "secrets", "versions", "access", "latest",
+                 f"--secret={name}", "--project=quantum-aikido-coaching"],
+                capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                add(name, r.stdout)
+    except Exception:
+        pass
+    return cands
+
+
 def jev(state):
-    url = os.environ.get("JEV_BASE_URL", "https://api.typesafe.ai/v1/systemone")
-    key = os.environ.get("JEV_API_KEY", "")
-    if not key:
-        return {"error": "JEV_API_KEY not set"}
+    url = os.environ.get(
+        "JEV_BASE_URL", "https://openrouter.ai/api/alpha/decisions")
+    if not url.startswith("https://"):
+        return {"error": "JEV_BASE_URL must be https"}
+    cands = _key_candidates()
+    if not cands:
+        return {"error": "no Jev key found (env JEV_API_KEY/"
+                "OPENROUTER_API_KEY, .env, or GCP SM quantum-aikido-coaching)"}
     payload = {"state": state, "model": os.environ.get("JEV_MODEL", "jev-latest"),
                "questions": QUESTIONS}
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {key}"})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}"}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+    last_err = "no key tried"
+    for name, key in cands:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code} via {name}"
+            if e.code not in (401, 403):
+                return {"error": last_err}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+    return {"error": f"all keys rejected ({last_err}) — rotate the Jev key"}
+
 
 
 def probability(answer):
